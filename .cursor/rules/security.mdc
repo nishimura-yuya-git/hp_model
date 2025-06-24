@@ -1,0 +1,452 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# 🔒 統合セキュリティルール（包括版）
+
+## 環境変数管理（必須）
+
+### 環境変数設定例
+```typescript
+// .env.local （開発環境）
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=eyJ... # 公開キー（フロントエンド用）
+SUPABASE_SERVICE_ROLE_KEY=eyJ... # サービスロールキー（サーバーサイド専用）
+
+# セキュリティ関連
+VITE_APP_ENV=development
+VITE_API_BASE_URL=https://api.yourapp.com
+VITE_ENABLE_ANALYTICS=true
+
+# 外部サービス
+STRIPE_PUBLIC_KEY=pk_test_...
+STRIPE_SECRET_KEY=sk_test_... # サーバーサイド専用
+SENDGRID_API_KEY=SG... # サーバーサイド専用
+
+# ❌ 絶対禁止：本番環境の秘匿情報をコミット
+# ❌ 絶対禁止：APIキーのハードコーディング
+```
+
+### 環境変数バリデーション
+```typescript
+// src/config/env.ts
+const requiredEnvVars = [
+  'VITE_SUPABASE_URL',
+  'VITE_SUPABASE_ANON_KEY',
+] as const;
+
+const validateEnv = () => {
+  const missing = requiredEnvVars.filter(
+    (envVar) => !import.meta.env[envVar]
+  );
+  
+  if (missing.length > 0) {
+    throw new Error(
+      `必須の環境変数が設定されていません: ${missing.join(', ')}`
+    );
+  }
+};
+
+validateEnv();
+```
+
+## Supabaseセキュリティ設定
+
+```typescript
+// src/lib/supabase.ts
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from '@/types/database.types';
+
+// 環境変数バリデーション（必須）
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabaseAnonKey) {
+  throw new Error(
+    'Supabase環境変数が設定されていません。VITE_SUPABASE_URLとVITE_SUPABASE_ANON_KEYを確認してください。'
+  );
+}
+
+// URLバリデーション
+if (!supabaseUrl.startsWith('https://') || !supabaseUrl.includes('.supabase.co')) {
+  throw new Error('不正なSupabase URLです');
+}
+
+export const supabase = createClient<Database>(supabaseUrl, supabaseAnonKey, {
+  auth: {
+    autoRefreshToken: true,
+    persistSession: true,
+    detectSessionInUrl: true,
+    flowType: 'pkce', // PKCE認証フロー（セキュリティ強化）
+    debug: import.meta.env.DEV,
+  },
+  global: {
+    headers: {
+      'x-application-name': 'luxury-brand-app',
+      'x-application-version': import.meta.env.VITE_APP_VERSION || '1.0.0',
+    },
+  },
+  realtime: {
+    params: {
+      eventsPerSecond: 10,
+    },
+  },
+  db: {
+    schema: 'public',
+  },
+});
+
+// セキュリティイベントの監視
+supabase.auth.onAuthStateChange((event, session) => {
+  // セキュリティログ（本番環境では外部ログサービスに送信）
+  if (import.meta.env.PROD) {
+    console.info('Auth event:', { event, userId: session?.user?.id });
+  }
+  
+  // 異常なログイン試行の検出
+  if (event === 'SIGNED_OUT' && !session) {
+    // 強制ログアウトの可能性
+    console.warn('Unexpected sign out detected');
+  }
+});
+```
+
+## 入力値検証・サニタイゼーション（包括版）
+
+```typescript
+// src/utils/validation.ts
+import { z } from 'zod';
+import DOMPurify from 'dompurify';
+
+// 共通バリデーションルール
+const commonRules = {
+  // メールアドレス（国際化対応）
+  email: z
+    .string()
+    .email('有効なメールアドレスを入力してください')
+    .min(1, 'メールアドレスは必須です')
+    .max(255, 'メールアドレスが長すぎます')
+    .transform(email => email.toLowerCase().trim()),
+
+  // パスワード（強力な要件）
+  password: z
+    .string()
+    .min(12, 'パスワードは12文字以上である必要があります')
+    .max(128, 'パスワードが長すぎます')
+    .regex(
+      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]/,
+      'パスワードは大文字・小文字・数字・特殊文字を含む必要があります'
+    )
+    .refine(
+      password => !commonPasswords.includes(password.toLowerCase()),
+      'よく使われるパスワードは使用できません'
+    ),
+
+  // 名前（多言語対応）
+  name: z
+    .string()
+    .min(1, '名前は必須です')
+    .max(100, '名前が長すぎます')
+    .regex(
+      /^[a-zA-Zあ-ん ァ-ヴー一-龯\u3400-\u4DBF\u4E00-\u9FFF\s\-'\.]+$/,
+      '名前に無効な文字が含まれています'
+    )
+    .transform(name => sanitizeInput(name)),
+
+  // UUID
+  uuid: z
+    .string()
+    .uuid('無効なID形式です'),
+
+  // URL
+  url: z
+    .string()
+    .url('有効なURLを入力してください')
+    .refine(url => url.startsWith('https://'), 'HTTPSのURLのみ許可されています'),
+
+  // JSON（安全性チェック付き）
+  safeJson: z
+    .string()
+    .refine(
+      str => {
+        try {
+          const parsed = JSON.parse(str);
+          return typeof parsed === 'object' && parsed !== null;
+        } catch {
+          return false;
+        }
+      },
+      '有効なJSON形式ではありません'
+    )
+    .transform(str => JSON.parse(str)),
+};
+
+// 複合バリデーション
+export const schemas = {
+  // ユーザー登録
+  register: z.object({
+    email: commonRules.email,
+    password: commonRules.password,
+    confirmPassword: z.string().min(1, 'パスワード確認は必須です'),
+    firstName: commonRules.name,
+    lastName: commonRules.name,
+    agreeToTerms: z.boolean().refine(val => val === true, '利用規約に同意してください'),
+    agreeToPrivacy: z.boolean().refine(val => val === true, 'プライバシーポリシーに同意してください'),
+  }).refine(
+    data => data.password === data.confirmPassword,
+    {
+      message: 'パスワードが一致しません',
+      path: ['confirmPassword'],
+    }
+  ),
+
+  // プロフィール更新
+  updateProfile: z.object({
+    firstName: commonRules.name.optional(),
+    lastName: commonRules.name.optional(),
+    bio: z
+      .string()
+      .max(500, '自己紹介は500文字以内で入力してください')
+      .optional()
+      .transform(bio => bio ? sanitizeInput(bio) : undefined),
+    website: commonRules.url.optional(),
+    avatar: z
+      .instanceof(File)
+      .refine(file => file.size <= 2 * 1024 * 1024, 'ファイルサイズは2MB以下である必要があります')
+      .refine(
+        file => ['image/jpeg', 'image/png', 'image/webp'].includes(file.type),
+        'JPEG、PNG、WebP形式のみ対応しています'
+      )
+      .optional(),
+  }),
+
+  // 検索クエリ
+  search: z.object({
+    query: z
+      .string()
+      .min(1, '検索キーワードは必須です')
+      .max(100, '検索キーワードが長すぎます')
+      .transform(query => sanitizeInput(query)),
+    filters: z
+      .object({
+        category: z.string().optional(),
+        dateFrom: z.string().datetime().optional(),
+        dateTo: z.string().datetime().optional(),
+        limit: z.number().min(1).max(100).default(20),
+        offset: z.number().min(0).default(0),
+      })
+      .optional(),
+  }),
+};
+
+// 高度なサニタイゼーション
+export const sanitizeInput = (input: string): string => {
+  // HTMLタグを安全に除去
+  const cleaned = DOMPurify.sanitize(input, { 
+    ALLOWED_TAGS: [],
+    ALLOWED_ATTR: [],
+  });
+  
+  return cleaned
+    .trim()
+    .replace(/\s+/g, ' ') // 連続する空白を単一空白に
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, '') // 制御文字除去
+    .substring(0, 1000); // 最大長制限
+};
+
+// SQLインジェクション検出
+export const detectSQLInjection = (input: string): boolean => {
+  const sqlPatterns = [
+    /(\b(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|EXEC|UNION|DECLARE)\b)/i,
+    /(\b(OR|AND)\s+(1=1|'1'='1'|"1"="1"))/i,
+    /(--|\/\*|\*\/|;)/,
+    /(\b(xp_|sp_|fn_)\w+)/i,
+    /(INFORMATION_SCHEMA|SYSOBJECTS|SYSCOLUMNS)/i,
+  ];
+
+  return sqlPatterns.some(pattern => pattern.test(input));
+};
+
+// XSS検出
+export const detectXSS = (input: string): boolean => {
+  const xssPatterns = [
+    /<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi,
+    /javascript:/gi,
+    /on\w+\s*=/gi,
+    /data:text\/html/gi,
+    /<iframe\b[^>]*>/gi,
+    /<object\b[^>]*>/gi,
+    /<embed\b[^>]*>/gi,
+  ];
+
+  return xssPatterns.some(pattern => pattern.test(input));
+};
+
+// よく使われるパスワードリスト（一部）
+const commonPasswords = [
+  'password', '123456', 'password123', 'admin', 'qwerty',
+  'letmein', 'welcome', 'monkey', '1234567890', 'password1'
+];
+```
+
+## 認証・認可システム
+
+### 1. 認証フック
+```typescript
+// src/hooks/auth/useAuth.ts
+import { useContext } from 'react';
+import { AuthContext } from '@/contexts/AuthContext';
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+};
+
+// 権限チェックフック
+export const usePermissions = () => {
+  const { user } = useAuth();
+  
+  const hasPermission = (permission: string, resourceId?: string) => {
+    // 権限チェックロジック
+    return checkUserPermission(user?.id, permission, resourceId);
+  };
+  
+  const hasRole = (role: string) => {
+    // ロールチェックロジック
+    return user?.app_metadata?.roles?.includes(role) ?? false;
+  };
+  
+  return { hasPermission, hasRole };
+};
+```
+
+### 2. 保護されたルート
+```typescript
+// src/components/common/ProtectedRoute.tsx
+import React from 'react';
+import { useAuth } from '@/hooks/auth/useAuth';
+
+interface ProtectedRouteProps {
+  children: React.ReactNode;
+  requiredPermission?: string;
+  requiredRole?: string;
+  fallback?: React.ReactNode;
+}
+
+export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
+  children,
+  requiredPermission,
+  requiredRole,
+  fallback
+}) => {
+  const { user, loading } = useAuth();
+  const { hasPermission, hasRole } = usePermissions();
+
+  if (loading) {
+    return <LoadingSpinner />;
+  }
+
+  if (!user) {
+    return <LoginRequired />;
+  }
+
+  if (requiredPermission && !hasPermission(requiredPermission)) {
+    return fallback || <AccessDenied />;
+  }
+
+  if (requiredRole && !hasRole(requiredRole)) {
+    return fallback || <AccessDenied />;
+  }
+
+  return <>{children}</>;
+};
+```
+
+## セキュリティヘッダー・CSP
+
+### Content Security Policy
+```typescript
+// vercel.json または Next.js config
+const securityHeaders = [
+  {
+    key: 'X-Content-Type-Options',
+    value: 'nosniff'
+  },
+  {
+    key: 'X-Frame-Options',
+    value: 'DENY'
+  },
+  {
+    key: 'X-XSS-Protection',
+    value: '1; mode=block'
+  },
+  {
+    key: 'Referrer-Policy',
+    value: 'strict-origin-when-cross-origin'
+  },
+  {
+    key: 'Permissions-Policy',
+    value: 'camera=(), microphone=(), geolocation=()'
+  },
+  {
+    key: 'Strict-Transport-Security',
+    value: 'max-age=31536000; includeSubDomains; preload'
+  },
+  {
+    key: 'Content-Security-Policy',
+    value: "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://js.stripe.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://api.stripe.com; frame-src https://js.stripe.com; object-src 'none'; base-uri 'self'; form-action 'self';"
+  }
+];
+```
+
+## エラーハンドリング・ログ
+
+### セキュリティログ
+```typescript
+// src/utils/security-logger.ts
+interface SecurityEvent {
+  type: 'auth_failure' | 'permission_denied' | 'suspicious_activity' | 'data_breach_attempt';
+  userId?: string;
+  ip?: string;
+  userAgent?: string;
+  details: Record<string, any>;
+  timestamp: string;
+}
+
+export const logSecurityEvent = async (event: SecurityEvent) => {
+  // 本番環境では外部セキュリティログサービスに送信
+  if (import.meta.env.PROD) {
+    await sendToSecurityService(event);
+  } else {
+    console.warn('Security Event:', event);
+  }
+  
+  // 重大なセキュリティイベントは即座にアラート
+  if (event.type === 'data_breach_attempt') {
+    await sendImmediateAlert(event);
+  }
+};
+```
+
+## セキュリティチェックリスト
+
+### 開発時チェック項目
+- [ ] 環境変数が適切に管理されているか
+- [ ] ハードコーディングされた機密情報がないか
+- [ ] 全てのユーザー入力にバリデーションが実装されているか
+- [ ] SQLインジェクション対策が適切か
+- [ ] XSS対策が適切か
+- [ ] CSRF対策が実装されているか
+- [ ] 認証・認可が適切に実装されているか
+- [ ] RLSポリシーが適切に設定されているか
+- [ ] エラーハンドリングで情報漏洩がないか
+- [ ] ログ出力に機密情報が含まれていないか
+- [ ] セキュリティヘッダーが適切に設定されているか
+- [ ] ファイルアップロードの制限が適切か
+- [ ] APIレート制限が実装されているか
+- [ ] セッション管理が適切か
+- [ ] 暗号化が適切に実装されているか

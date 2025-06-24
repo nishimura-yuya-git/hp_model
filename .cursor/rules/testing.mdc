@@ -1,0 +1,555 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# 🧪 包括的テスト戦略・品質保証
+
+## テスト設定・環境
+
+### Vitest設定
+```typescript
+// vitest.config.ts
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+import { resolve } from 'path';
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    globals: true,
+    environment: 'jsdom',
+    setupFiles: ['./src/tests/setup.ts'],
+    include: ['src/**/*.{test,spec}.{js,mjs,cjs,ts,mts,cts,jsx,tsx}'],
+    exclude: ['node_modules', 'dist', 'build'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json', 'html', 'lcov'],
+      exclude: [
+        'node_modules/',
+        'dist/',
+        'build/',
+        'src/tests/',
+        '**/*.d.ts',
+        '**/*.config.{js,ts}',
+        '**/index.ts',
+      ],
+      thresholds: {
+        global: {
+          branches: 80,
+          functions: 80,
+          lines: 80,
+          statements: 80,
+        },
+      },
+    },
+  },
+  resolve: {
+    alias: {
+      '@': resolve(__dirname, 'src'),
+    },
+  },
+});
+```
+
+### テストセットアップ
+```typescript
+// src/tests/setup.ts
+import '@testing-library/jest-dom';
+import { vi, beforeAll, afterEach, afterAll } from 'vitest';
+import { cleanup } from '@testing-library/react';
+
+// Supabaseのモック
+vi.mock('@/lib/supabase', () => ({
+  supabase: {
+    auth: {
+      getSession: vi.fn(() => Promise.resolve({ data: { session: null } })),
+      onAuthStateChange: vi.fn(() => ({
+        data: { subscription: { unsubscribe: vi.fn() } }
+      })),
+      signInWithPassword: vi.fn(),
+      signUp: vi.fn(),
+      signOut: vi.fn(),
+    },
+    from: vi.fn(() => ({
+      select: vi.fn(() => ({
+        eq: vi.fn(() => Promise.resolve({ data: [], error: null })),
+      })),
+      insert: vi.fn(() => Promise.resolve({ data: null, error: null })),
+      update: vi.fn(() => Promise.resolve({ data: null, error: null })),
+      delete: vi.fn(() => Promise.resolve({ data: null, error: null })),
+    })),
+  },
+}));
+
+// ResizeObserverのモック
+global.ResizeObserver = vi.fn().mockImplementation(() => ({
+  observe: vi.fn(),
+  unobserve: vi.fn(),
+  disconnect: vi.fn(),
+}));
+
+// IntersectionObserverのモック
+global.IntersectionObserver = vi.fn().mockImplementation(() => ({
+  observe: vi.fn(),
+  unobserve: vi.fn(),
+  disconnect: vi.fn(),
+}));
+
+beforeAll(() => {
+  // テスト前の共通セットアップ
+});
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+afterAll(() => {
+  // テスト後のクリーンアップ
+});
+```
+
+## ユニットテスト戦略
+
+### コンポーネントテスト例
+```typescript
+// src/components/ui/Button/Button.test.tsx
+import { render, screen, fireEvent } from '@testing-library/react';
+import { vi } from 'vitest';
+import { Button } from './Button';
+
+describe('Button コンポーネント', () => {
+  it('基本的なレンダリングができる', () => {
+    render(<Button>テストボタン</Button>);
+    expect(screen.getByRole('button', { name: 'テストボタン' })).toBeInTheDocument();
+  });
+
+  it('クリックイベントが正しく発火する', () => {
+    const handleClick = vi.fn();
+    render(<Button onClick={handleClick}>クリック</Button>);
+    
+    fireEvent.click(screen.getByRole('button'));
+    expect(handleClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('disabled状態では クリックできない', () => {
+    const handleClick = vi.fn();
+    render(<Button disabled onClick={handleClick}>無効ボタン</Button>);
+    
+    fireEvent.click(screen.getByRole('button'));
+    expect(handleClick).not.toHaveBeenCalled();
+  });
+
+  it('loading状態では適切なUIが表示される', () => {
+    render(<Button loading>ローディング</Button>);
+    expect(screen.getByRole('button')).toBeDisabled();
+    // スピナーの存在確認
+    expect(document.querySelector('.animate-spin')).toBeInTheDocument();
+  });
+
+  it('各variantで適切なスタイルが適用される', () => {
+    const { rerender } = render(<Button variant="primary">プライマリ</Button>);
+    expect(screen.getByRole('button')).toHaveClass('bg-gradient-to-r');
+    
+    rerender(<Button variant="outline">アウトライン</Button>);
+    expect(screen.getByRole('button')).toHaveClass('border-2');
+  });
+});
+```
+
+### カスタムフックテスト例
+```typescript
+// src/hooks/auth/useAuth.test.ts
+import { renderHook, act } from '@testing-library/react';
+import { vi } from 'vitest';
+import { useAuth } from './useAuth';
+import { AuthProvider } from '@/contexts/AuthContext';
+
+const wrapper = ({ children }: { children: React.ReactNode }) => (
+  <AuthProvider>{children}</AuthProvider>
+);
+
+describe('useAuth フック', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('初期状態では loading が true', () => {
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    expect(result.current.loading).toBe(true);
+    expect(result.current.user).toBe(null);
+  });
+
+  it('ログイン処理が正常に動作する', async () => {
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    
+    await act(async () => {
+      const response = await result.current.signIn('test@example.com', 'password123');
+      expect(response.error).toBe(null);
+    });
+  });
+
+  it('不正なメールアドレスでログインエラーが発生する', async () => {
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    
+    await act(async () => {
+      const response = await result.current.signIn('invalid-email', 'password123');
+      expect(response.error).toBeTruthy();
+    });
+  });
+});
+```
+
+## セキュリティテスト
+
+### セキュリティテスト例
+```typescript
+// src/tests/security.test.ts
+import { describe, it, expect } from 'vitest';
+import { 
+  sanitizeInput, 
+  detectSQLInjection, 
+  detectXSS,
+  schemas 
+} from '@/utils/validation';
+
+describe('セキュリティテスト', () => {
+  describe('入力値サニタイゼーション', () => {
+    it('HTMLタグを除去する', () => {
+      const maliciousInput = '<script>alert("xss")</script>Hello';
+      const sanitized = sanitizeInput(maliciousInput);
+      expect(sanitized).not.toContain('<script>');
+      expect(sanitized).toContain('Hello');
+    });
+
+    it('SQLインジェクション攻撃を検出する', () => {
+      const sqlAttacks = [
+        "'; DROP TABLE users; --",
+        "admin'--",
+        "' OR '1'='1",
+        "UNION SELECT * FROM users",
+      ];
+
+      sqlAttacks.forEach(attack => {
+        expect(detectSQLInjection(attack)).toBe(true);
+      });
+    });
+
+    it('XSS攻撃を検出する', () => {
+      const xssAttacks = [
+        '<script>alert("xss")</script>',
+        'javascript:alert("xss")',
+        '<img src="x" onerror="alert(1)">',
+        '<iframe src="javascript:alert(1)"></iframe>',
+      ];
+
+      xssAttacks.forEach(attack => {
+        expect(detectXSS(attack)).toBe(true);
+      });
+    });
+  });
+
+  describe('パスワードバリデーション', () => {
+    it('弱いパスワードを拒否する', () => {
+      const weakPasswords = [
+        'password',
+        '123456',
+        'qwerty',
+        'abc123',
+      ];
+
+      weakPasswords.forEach(password => {
+        const result = schemas.register.safeParse({
+          email: 'test@example.com',
+          password,
+          confirmPassword: password,
+          firstName: 'Test',
+          lastName: 'User',
+          agreeToTerms: true,
+          agreeToPrivacy: true,
+        });
+        expect(result.success).toBe(false);
+      });
+    });
+
+    it('強いパスワードを受け入れる', () => {
+      const strongPassword = 'MyStr0ng!P@ssw0rd2024';
+      const result = schemas.register.safeParse({
+        email: 'test@example.com',
+        password: strongPassword,
+        confirmPassword: strongPassword,
+        firstName: 'Test',
+        lastName: 'User',
+        agreeToTerms: true,
+        agreeToPrivacy: true,
+      });
+      expect(result.success).toBe(true);
+    });
+  });
+});
+```
+
+## E2Eテスト（Playwright）
+
+### Playwright設定
+```typescript
+// playwright.config.ts
+import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './src/tests/e2e',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 1 : undefined,
+  reporter: 'html',
+  use: {
+    baseURL: 'http://localhost:3000',
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+  },
+
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'firefox',
+      use: { ...devices['Desktop Firefox'] },
+    },
+    {
+      name: 'webkit',
+      use: { ...devices['Desktop Safari'] },
+    },
+    {
+      name: 'Mobile Chrome',
+      use: { ...devices['Pixel 5'] },
+    },
+    {
+      name: 'Mobile Safari',
+      use: { ...devices['iPhone 12'] },
+    },
+  ],
+
+  webServer: {
+    command: 'npm run dev',
+    url: 'http://localhost:3000',
+    reuseExistingServer: !process.env.CI,
+  },
+});
+```
+
+### E2Eテスト例
+```typescript
+// src/tests/e2e/auth.spec.ts
+import { test, expect } from '@playwright/test';
+
+test.describe('認証フロー', () => {
+  test('ユーザー登録からログインまでの完全フロー', async ({ page }) => {
+    // ホームページにアクセス
+    await page.goto('/');
+    
+    // 登録ページに移動
+    await page.click('text=新規登録');
+    await expect(page).toHaveURL('/auth/register');
+    
+    // 登録フォームに入力
+    await page.fill('[data-testid=email]', 'test@example.com');
+    await page.fill('[data-testid=password]', 'MyStr0ng!P@ssw0rd2024');
+    await page.fill('[data-testid=confirmPassword]', 'MyStr0ng!P@ssw0rd2024');
+    await page.fill('[data-testid=firstName]', 'テスト');
+    await page.fill('[data-testid=lastName]', 'ユーザー');
+    await page.check('[data-testid=agreeToTerms]');
+    await page.check('[data-testid=agreeToPrivacy]');
+    
+    // 登録ボタンをクリック
+    await page.click('[data-testid=register-button]');
+    
+    // 成功メッセージの確認
+    await expect(page.locator('text=登録が完了しました')).toBeVisible();
+    
+    // ログインページに移動
+    await page.click('text=ログイン');
+    await expect(page).toHaveURL('/auth/login');
+    
+    // ログインフォームに入力
+    await page.fill('[data-testid=email]', 'test@example.com');
+    await page.fill('[data-testid=password]', 'MyStr0ng!P@ssw0rd2024');
+    
+    // ログインボタンをクリック
+    await page.click('[data-testid=login-button]');
+    
+    // ダッシュボードにリダイレクトされることを確認
+    await expect(page).toHaveURL('/dashboard');
+    await expect(page.locator('text=ダッシュボード')).toBeVisible();
+  });
+
+  test('無効な認証情報でログインエラーが表示される', async ({ page }) => {
+    await page.goto('/auth/login');
+    
+    await page.fill('[data-testid=email]', 'invalid@example.com');
+    await page.fill('[data-testid=password]', 'wrongpassword');
+    await page.click('[data-testid=login-button]');
+    
+    await expect(page.locator('text=ログインに失敗しました')).toBeVisible();
+  });
+});
+```
+
+## パフォーマンステスト
+
+### Lighthouse CI設定
+```javascript
+// .lighthouserc.js
+module.exports = {
+  ci: {
+    collect: {
+      url: ['http://localhost:3000/', 'http://localhost:3000/dashboard'],
+      startServerCommand: 'npm run build && npm run preview',
+      numberOfRuns: 3,
+    },
+    assert: {
+      assertions: {
+        'categories:performance': ['warn', { minScore: 0.9 }],
+        'categories:accessibility': ['error', { minScore: 0.9 }],
+        'categories:best-practices': ['warn', { minScore: 0.9 }],
+        'categories:seo': ['warn', { minScore: 0.9 }],
+        'categories:pwa': ['warn', { minScore: 0.8 }],
+      },
+    },
+    upload: {
+      target: 'temporary-public-storage',
+    },
+  },
+};
+```
+
+## 品質チェックリスト
+
+### プルリクエスト必須確認項目
+```markdown
+## 🔒 セキュリティチェック
+- [ ] 環境変数が適切に管理されているか
+- [ ] ハードコーディングされた機密情報がないか
+- [ ] 全てのユーザー入力にバリデーションが実装されているか
+- [ ] SQLインジェクション対策が適切か
+- [ ] XSS対策が適切か
+- [ ] CSRF対策が実装されているか
+- [ ] 認証・認可が適切に実装されているか
+- [ ] RLSポリシーが適切に設定されているか
+
+## 🧪 テスト・品質チェック
+- [ ] ユニットテストが適切に書かれているか
+- [ ] E2Eテストが主要フローをカバーしているか
+- [ ] セキュリティテストが実装されているか
+- [ ] パフォーマンステストが実行されているか
+- [ ] テストカバレッジが80%以上か
+- [ ] TypeScript型チェックがパスするか
+- [ ] ESLintルールに違反がないか
+- [ ] Prettierフォーマットが適用されているか
+
+## ⚡ パフォーマンス・最適化チェック
+- [ ] 画像が最適化されているか（WebP推奨）
+- [ ] バンドルサイズが適切か（1MB以下推奨）
+- [ ] コード分割が適切に実装されているか
+- [ ] 遅延読み込みが実装されているか
+- [ ] キャッシュ戦略が適切か
+- [ ] Core Web Vitalsが良好か
+- [ ] Lighthouseスコアが90以上か
+
+## 🌐 SEO・アクセシビリティチェック
+- [ ] メタタグが適切に設定されているか
+- [ ] 構造化データが実装されているか
+- [ ] セマンティックHTMLが使用されているか
+- [ ] alt属性が適切に設定されているか
+- [ ] キーボードナビゲーションが可能か
+- [ ] スクリーンリーダー対応がされているか
+- [ ] カラーコントラストが適切か
+```
+
+## CI/CD設定
+
+### GitHub Actions設定
+```yaml
+# .github/workflows/ci-cd.yml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test & Security Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Type check
+        run: npm run type-check
+        
+      - name: Lint
+        run: npm run lint
+        
+      - name: Format check
+        run: npm run format:check
+        
+      - name: Unit tests
+        run: npm run test:coverage
+        
+      - name: Security audit
+        run: npm run security:audit
+        
+      - name: Build
+        run: npm run build
+        
+      - name: E2E tests
+        run: npx playwright install && npm run test:e2e
+        
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+```
+
+## 継続的品質改善
+
+### 技術的負債管理
+```typescript
+// 技術的負債の定期チェック項目
+const TECHNICAL_DEBT_CHECKLIST = {
+  weekly: [
+    'ESLint警告の解消',
+    'TypeScript strict警告の解消',
+    'テストカバレッジの改善',
+    'パッケージのセキュリティ監査',
+  ],
+  monthly: [
+    'パッケージ依存関係の更新',
+    'パフォーマンス指標の分析',
+    'コードの複雑度測定',
+    'データベースクエリの最適化',
+  ],
+  quarterly: [
+    'アーキテクチャの見直し',
+    'セキュリティペネトレーションテスト',
+    'ユーザビリティテスト',
+    'インフラコストの最適化',
+  ],
+};
+```
